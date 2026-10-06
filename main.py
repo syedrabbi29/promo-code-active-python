@@ -6,16 +6,19 @@ from flask import Flask
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
+# --- Environment Variables ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
-TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "")
+TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "klyx_news")
+DEFAULT_BOT = os.environ.get("TARGET_BOT", "klyxx_bot)
 
+# Render সচল রাখতে ব্যাকগ্রাউন্ড সার্ভার
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is alive and running 24/7!"
+    return "Ultra Hybrid Sniper is Running 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -23,101 +26,129 @@ def run_flask():
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
+# প্রসেস করা পোস্ট বা কোড ট্র্যাক রাখার জন্য মেমোরি সেট
+processed_posts = set()
+processed_codes = set()
+
 async def send_log(text):
+    """Saved Messages-এ তাৎক্ষণিক লগ পাঠানো"""
     try:
         await client.send_message('me', text, parse_mode='html')
     except Exception as e:
         print(f"[!] Saved Messages Error: {e}")
 
+async def send_code_to_bot(code):
+    """সরাসরি বটের ইনবক্সে দ্রুত কোড পাঠানো"""
+    if code in processed_codes:
+        return
+    processed_codes.add(code)
+    
+    cmd = f"/start promo_{code}"
+    try:
+        await client.send_message(DEFAULT_BOT, cmd)
+        await send_log(
+            f"⚡ <b>ইনস্ট্যান্ট কোড ফায়ার করা হয়েছে!</b>\n"
+            f"🤖 বট: @{DEFAULT_BOT}\n"
+            f"📋 কমান্ড: <code>{cmd}</code>\n"
+            f"🔑 কোড: <code>{code}</code>"
+        )
+    except Exception as e:
+        await send_log(f"⚠️ বটে কোড পাঠাতে এরর: {e}")
+
+async def click_buttons(message):
+    """পোস্টের সব ধরনের বাটনে ক্লিক করা"""
+    if not message.buttons:
+        return False
+
+    clicked_any = False
+    for row in message.buttons:
+        for btn in row:
+            btn_name = btn.text
+            url = getattr(btn, 'url', None)
+
+            # কেইস ১: লিংক বাটন (ডিপ-লিংক)
+            if url:
+                if ('t.me/' in url or 'telegram.me/' in url) and 'start=' in url:
+                    try:
+                        domain = 'telegram.me/' if 'telegram.me/' in url else 't.me/'
+                        clean_part = url.split(domain)[1]
+                        bot_target = clean_part.split('?')[0]
+                        start_param = clean_part.split('start=')[1].split('&')[0]
+
+                        await client.send_message(bot_target, f"/start {start_param}")
+                        await send_log(
+                            f"✅ <b>বাটন ডিপ-লিংক একটিভ!</b>\n"
+                            f"🤖 বট: @{bot_target}\n"
+                            f"🔘 বাটন: <b>{btn_name}</b>\n"
+                            f"🔑 প্যারাম: <code>{start_param}</code>"
+                        )
+                        clicked_any = True
+                    except Exception as err:
+                        await send_log(f"⚠️ বাটনের ডিপ-লিংকে সমস্যা: {err}")
+                else:
+                    await send_log(f"🔗 <b>ওয়েব URL বাটন:</b> {btn_name}\n🌐 লিংক: {url}")
+                    clicked_any = True
+
+            # কেইস ২: ইনলাইন বাটন (যেমন Giveaway Participate)
+            else:
+                try:
+                    await btn.click()
+                    await send_log(
+                        f"🎉 <b>বাটনে সফলভাবে ক্লিক করা হয়েছে!</b>\n"
+                        f"🔘 বাটন: <b>{btn_name}</b>\n"
+                        f"📝 পোস্ট আইডি: <code>{message.id}</code>"
+                    )
+                    clicked_any = True
+                except Exception as err:
+                    await send_log(f"⚠️ বাটন ক্লিকে এরর: {err}")
+    return clicked_any
+
+# ১. নতুন পোস্ট এলে (ইনস্ট্যান্ট প্যারালাল অ্যাটাক)
 @client.on(events.NewMessage(chats=TARGET_CHANNEL))
-async def handle_post(event):
+async def handle_new_post(event):
     msg = event.message
-    raw_text = msg.raw_text or ""
+    post_text = msg.raw_text or ""
     print(f"\n[⚡ NEW POST] ID: {msg.id}")
 
-    action_done = False
+    # কাজ ১: টেক্সটে কোড থাকলে ১ মিলি-সেকেন্ডও অপেক্ষা না করে সরাসরি বটে ফায়ার করা
+    code_match = re.search(r'Code:\s*([A-Za-z0-9_-]+)', post_text, re.IGNORECASE)
+    if code_match:
+        promo_code = code_match.group(1).strip()
+        asyncio.create_task(send_code_to_bot(promo_code))
 
-    # ১. বাটন চেক করা
+    # কাজ ২: সাথে সাথে বাটন থাকলে বাটন ক্লিক করা
     if msg.buttons:
-        print("[*] বাটনে ক্লিক করার চেষ্টা চলছে...")
-        for row in msg.buttons:
-            for btn in row:
-                btn_name = btn.text
-                btn_url = getattr(btn, 'url', None)
+        asyncio.create_task(click_buttons(msg))
+        processed_posts.add(msg.id)
 
-                # কেইস ক: লিংক বাটন
-                if btn_url:
-                    print(f"[+] লিংক বাটন: {btn_name} -> {btn_url}")
-                    # t.me অথবা telegram.me লিংক
-                    if ('t.me/' in btn_url or 'telegram.me/' in btn_url) and 'start=' in btn_url:
-                        try:
-                            domain = 'telegram.me/' if 'telegram.me/' in btn_url else 't.me/'
-                            clean_part = btn_url.split(domain)[1]
-                            bot_target = clean_part.split('?')[0]
-                            start_code = clean_part.split('start=')[1].split('&')[0]
+# ২. পোস্ট এডিট হয়ে বাটন যুক্ত হলে (ব্যাকগ্রাউন্ড লিসেনার)
+@client.on(events.MessageEdited(chats=TARGET_CHANNEL))
+async def handle_edited_post(event):
+    msg = event.message
+    # যদি এই পোস্টে আগেই বাটন ক্লিক করা হয়ে থাকে তবে আর করবে না
+    if msg.id in processed_posts:
+        return
 
-                            await client.send_message(bot_target, f"/start {start_code}")
-                            await send_log(
-                                f"✅ <b>বট ডিপ-লিংক অ্যাক্টিভ করা হয়েছে!</b>\n"
-                                f"🤖 বট: @{bot_target}\n"
-                                f"🔑 কোড: <code>{start_code}</code>"
-                            )
-                            action_done = True
-                            break
-                        except Exception as err:
-                            await send_log(f"⚠️ বটে মেসেজ পাঠাতে ব্যর্থ: {err}")
+    if msg.buttons:
+        print(f"[*] মেসেজ এডিট হয়ে বাটন এসেছে (ID: {msg.id}), বাটন ক্লিক হচ্ছে...")
+        if await click_buttons(msg):
+            processed_posts.add(msg.id)
 
-                # কেইস খ: সাধারণ ইনলাইন বাটন (যার কোনো URL নেই)
-                elif not btn_url:
-                    try:
-                        await btn.click()
-                        await send_log(f"✅ <b>ইনলাইন বাটনে ক্লিক সম্পন্ন!</b>\n🔘 বাটন: <b>{btn_name}</b>")
-                        action_done = True
-                        break
-                    except Exception as err:
-                        await send_log(f"⚠️ বাটনে ক্লিক ব্যর্থ: {err}")
-
-            if action_done:
-                break
-
-    # ২. যদি কোনো বাটন না পাওয়া যায় বা বাটনে কাজ না হয় (মেসেজের ভেতরের লিংক খোঁজা)
-    if not action_done:
-        # মেসেজ টেক্সটের ভেতরে কোনো t.me লিংক আছে কি না খোঁজা
-        match = re.search(r'(?:https?://)?(?:t|telegram)\.me/([a-zA-Z0-9_]+)\?start=([a-zA-Z0-9_-]+)', raw_text)
-        if match:
-            bot_target = match.group(1)
-            start_code = match.group(2)
-            try:
-                await client.send_message(bot_target, f"/start {start_code}")
-                await send_log(
-                    f"✅ <b>টেক্সট লিংক থেকে কোড অ্যাক্টিভ করা হয়েছে!</b>\n"
-                    f"🤖 বট: @{bot_target}\n"
-                    f"🔑 কোড: <code>{start_code}</code>"
-                )
-                action_done = True
-            except Exception as err:
-                await send_log(f"⚠️ টেক্সট লিংকের বটে মেসেজ পাঠাতে সমস্যা: {err}")
-
-    # ৩. যদি বাটনে বা টেক্সটে কোনো অ্যাকশনই নেওয়া না যায়
-    if not action_done:
-        await send_log(
-            f"ℹ️ <b>পোস্টে কোনো ক্লিকযোগ্য বাটন বা স্টার্ট-লিংক পাওয়া যায়নি!</b>\n"
-            f"মেসেজ প্রিভিউ:\n<code>{raw_text[:200]}</code>"
-        )
-
-async def start_bot():
-    print("[*] Telegram Client চালু হচ্ছে...")
+async def main():
+    print("[*] টেলিগ্রামে কানেক্ট হচ্ছে...")
     await client.start()
     me = await client.get_me()
-    welcome_msg = (
-        f"🚀 <b>Promo Bot সফলভাবে লাইভ হয়েছে!</b>\n"
+    welcome_text = (
+        f"🚀 <b>Ultra Hybrid Sniper চালু হয়েছে!</b>\n"
         f"👤 অ্যাকাউন্ট: <b>{me.first_name}</b>\n"
-        f"🎯 মনিটর চ্যানেল: <code>{TARGET_CHANNEL}</code>"
+        f"🎯 মনিটর চ্যানেল: <code>{TARGET_CHANNEL}</code>\n"
+        f"🤖 টার্গেট বট: <code>@{DEFAULT_BOT}</code>\n"
+        f"⚡ <i>Zero-Delay Parallel Attack সক্রিয়।</i>"
     )
-    print(welcome_msg)
-    await send_log(welcome_msg)
+    print(welcome_text)
+    await send_log(welcome_text)
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
     threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(start_bot())
+    asyncio.run(main())
