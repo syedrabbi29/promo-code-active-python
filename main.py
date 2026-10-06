@@ -13,7 +13,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "klyx_news")
 DEFAULT_BOT = os.environ.get("TARGET_BOT", "klyxx_bot")
 
-# Render সচল রাখতে ব্যাকগ্রাউন্ড সার্ভার
+# Render সচল রাখতে ব্যাকগ্রাউন্ড Flask সার্ভার
 app = Flask(__name__)
 
 @app.route('/')
@@ -26,6 +26,7 @@ def run_flask():
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
+# ডুপ্লিকেট মেসেজ ও বারবার রিকোয়েস্ট পাঠানো ঠেকানোর জন্য মেমোরি সেট
 processed_posts = set()
 processed_codes = set()
 
@@ -37,11 +38,11 @@ async def send_log(text):
         print(f"[!] Saved Messages Error: {e}")
 
 async def send_code_to_bot(code):
-    """সরাসরি বটের ইনবক্সে দ্রুত কোড পাঠানো"""
+    """সরাসরি বটের ইনবক্সে কোনো প্রকার বিলম্ব ছাড়া কোড পাঠানো"""
     if code in processed_codes:
         return
     processed_codes.add(code)
-    
+
     cmd = f"/start promo_{code}"
     try:
         await client.send_message(DEFAULT_BOT, cmd)
@@ -76,7 +77,7 @@ async def click_buttons(message):
 
                         await client.send_message(bot_target, f"/start {start_param}")
                         await send_log(
-                            f"✅ <b>বাটন ডিপ-লিংক একটিভ!</b>\n"
+                            f"✅ <b>বাটন ডিপ-লিংক অ্যাক্টিভ!</b>\n"
                             f"🤖 বট: @{bot_target}\n"
                             f"🔘 বাটন: <b>{btn_name}</b>\n"
                             f"🔑 প্যারাম: <code>{start_param}</code>"
@@ -102,25 +103,25 @@ async def click_buttons(message):
                     await send_log(f"⚠️ বাটন ক্লিকে এরর: {err}")
     return clicked_any
 
-# ১. নতুন পোস্ট এলে (ইনস্ট্যান্ট প্যারালাল অ্যাটাক)
+# ১. নতুন পোস্ট এলে (ইনস্ট্যান্ট প্যারালাল প্রসেসিং)
 @client.on(events.NewMessage(chats=TARGET_CHANNEL))
 async def handle_new_post(event):
     msg = event.message
     post_text = msg.raw_text or ""
     print(f"\n[⚡ NEW POST] ID: {msg.id}")
 
-    # কোড থাকলে সরাসরি বটে ফায়ার করা
+    # কোড থাকলে কোনো অপেক্ষা ছাড়াই সরাসরি বটে ফায়ার করা
     code_match = re.search(r'Code:\s*([A-Za-z0-9_-]+)', post_text, re.IGNORECASE)
     if code_match:
         promo_code = code_match.group(1).strip()
         asyncio.create_task(send_code_to_bot(promo_code))
 
-    # বাটন থাকলে বাটন ক্লিক করা
+    # বাটন থাকলে সাথে সাথে বাটন ক্লিক করা
     if msg.buttons:
         asyncio.create_task(click_buttons(msg))
         processed_posts.add(msg.id)
 
-# ২. পোস্ট এডিট হয়ে বাটন যুক্ত হলে
+# ২. পোস্ট এডিট হয়ে বাটন যুক্ত হলে (ব্যাকগ্রাউন্ড লিসেনার)
 @client.on(events.MessageEdited(chats=TARGET_CHANNEL))
 async def handle_edited_post(event):
     msg = event.message
@@ -137,7 +138,7 @@ async def main():
     await client.start()
     me = await client.get_me()
     welcome_text = (
-        f"🚀 <b>Ultra Hybrid Sniper চালু হয়েছে!</b>\n"
+        f"🚀 <b>Ultra Hybrid Sniper সফলভাবে চালু হয়েছে!</b>\n"
         f"👤 অ্যাকাউন্ট: <b>{me.first_name}</b>\n"
         f"🎯 মনিটর চ্যানেল: <code>{TARGET_CHANNEL}</code>\n"
         f"🤖 টার্গেট বট: <code>@{DEFAULT_BOT}</code>\n"
