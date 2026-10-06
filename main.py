@@ -11,7 +11,7 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "klyx_news")
-DEFAULT_BOT = os.environ.get("TARGET_BOT", "klyxx_bot)
+DEFAULT_BOT = os.environ.get("TARGET_BOT", "klyxx_bot")
 
 # Render সচল রাখতে ব্যাকগ্রাউন্ড সার্ভার
 app = Flask(__name__)
@@ -26,7 +26,6 @@ def run_flask():
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# প্রসেস করা পোস্ট বা কোড ট্র্যাক রাখার জন্য মেমোরি সেট
 processed_posts = set()
 processed_codes = set()
 
@@ -110,22 +109,21 @@ async def handle_new_post(event):
     post_text = msg.raw_text or ""
     print(f"\n[⚡ NEW POST] ID: {msg.id}")
 
-    # কাজ ১: টেক্সটে কোড থাকলে ১ মিলি-সেকেন্ডও অপেক্ষা না করে সরাসরি বটে ফায়ার করা
+    # কোড থাকলে সরাসরি বটে ফায়ার করা
     code_match = re.search(r'Code:\s*([A-Za-z0-9_-]+)', post_text, re.IGNORECASE)
     if code_match:
         promo_code = code_match.group(1).strip()
         asyncio.create_task(send_code_to_bot(promo_code))
 
-    # কাজ ২: সাথে সাথে বাটন থাকলে বাটন ক্লিক করা
+    # বাটন থাকলে বাটন ক্লিক করা
     if msg.buttons:
         asyncio.create_task(click_buttons(msg))
         processed_posts.add(msg.id)
 
-# ২. পোস্ট এডিট হয়ে বাটন যুক্ত হলে (ব্যাকগ্রাউন্ড লিসেনার)
+# ২. পোস্ট এডিট হয়ে বাটন যুক্ত হলে
 @client.on(events.MessageEdited(chats=TARGET_CHANNEL))
 async def handle_edited_post(event):
     msg = event.message
-    # যদি এই পোস্টে আগেই বাটন ক্লিক করা হয়ে থাকে তবে আর করবে না
     if msg.id in processed_posts:
         return
 
