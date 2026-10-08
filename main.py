@@ -8,8 +8,6 @@ from flask import Flask
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, BotResponseTimeoutError
 from telethon.sessions import StringSession
-from telethon.tl.functions.account import UpdateStatusRequest
-from telethon.tl.functions.help import GetConfigRequest
 
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
@@ -31,12 +29,11 @@ ACCOUNTS = [
 
 TARGET_CHANNELS = [
     c.strip()
-    for c in os.environ.get("TARGET_CHANNELS", "klyx_news,my_test_promo_channel").split(",")
+    for c in os.environ.get("TARGET_CHANNELS", "klyx_news").split(",")
     if c.strip()
 ]
 DEFAULT_BOT = os.environ.get("TARGET_BOT", "klyxx_bot")
-
-ONLINE_INTERVAL = float(os.environ.get("ONLINE_INTERVAL", 25))
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", 0.8))
 LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET_HOURS", 6))))
 
 CODE_PATTERN = re.compile(r'Code:\s*([A-Za-z0-9_-]+)', re.IGNORECASE)
@@ -44,9 +41,11 @@ DEEP_LINK_PATTERN = re.compile(r'(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)\?(?:[^#\
 
 app = Flask(__name__)
 
+
 @app.route('/')
 def home():
-    return "Ultra-Responsive Dual-Account Sniper Running 24/7!"
+    return "Ultra-Fast Dual Sniper Running 24/7!"
+
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -62,12 +61,13 @@ class SniperWorker:
             api_hash,
             connection_retries=None,
             retry_delay=1,
-            auto_reconnect=True
+            auto_reconnect=True,
         )
         self.client.flood_sleep_threshold = 0
         self.processed_posts = set()
         self.fired_payloads = set()
         self.tasks = set()
+        self.channel_entities = {}
 
     def spawn(self, coro):
         task = asyncio.create_task(coro)
@@ -92,7 +92,6 @@ class SniperWorker:
 
         cmd = f"/start {payload}"
         try:
-            # ইনস্ট্যান্ট কমান্ড ফায়ার
             await self.client.send_message(bot, cmd)
         except FloodWaitError as err:
             self.fired_payloads.discard(key)
@@ -132,7 +131,7 @@ class SniperWorker:
                     self.log(f"⏳ Flood wait: {err.seconds}s")
                     return None
                 except Exception as err:
-                    self.log(f"⚠️ Click error: {err}")
+                    self.log(f"⚠️ Button click error ({btn.text}): {err}")
                     continue
 
                 return f"Clicked button <b>{btn.text}</b>"
@@ -152,7 +151,7 @@ class SniperWorker:
         match = CODE_PATTERN.search(msg.raw_text or "")
         if match:
             result = await self.fire(DEFAULT_BOT, f"promo_{match.group(1)}")
-        
+
         if not result and msg.buttons:
             result = await self.click_buttons(msg)
 
@@ -161,11 +160,11 @@ class SniperWorker:
             return
 
         action_ms = (time.perf_counter() - started) * 1000
-        event_time = msg.edit_date if source == "edit" and msg.edit_date else msg.date
+        is_edit = source.endswith("edit")
+        event_time = msg.edit_date if is_edit and msg.edit_date else msg.date
         lag = seen_at - event_time.timestamp()
-        label = "Edited" if source == "edit" else "Posted"
-        
-        # সফল হওয়ার পর ব্যাকগ্রাউন্ডে লগ পাঠানো
+        label = "Edited" if is_edit else "Posted"
+
         self.log(
             f"✅ {result}\n"
             f"📡 Source: {source}\n"
@@ -175,50 +174,81 @@ class SniperWorker:
             f"📝 Post ID: <code>{msg.id}</code>"
         )
 
-    async def keep_online(self):
-        """কানেকশন সক্রিয় ও হাই-প্রায়োরিটি রাখার লুপ"""
+    async def on_new(self, event):
+        await self.process_msg(event.message, "push_new")
+
+    async def on_edit(self, event):
+        await self.process_msg(event.message, "push_edit")
+
+    async def fast_channel_tracker(self, channel):
+        entity = self.channel_entities.get(channel)
+        if not entity:
+            return
+
+        last_id = 0
+        try:
+            msgs = await self.client.get_messages(entity, limit=1)
+            if msgs:
+                last_id = msgs[0].id
+        except Exception as err:
+            print(f"[!] {self.name} tracker init error ({channel}): {err}")
+            return
+
         while True:
+            await asyncio.sleep(POLL_INTERVAL)
             try:
-                # টেলিগ্রামের মূল সার্ভারে পিং পাঠিয়ে অনলাইন স্ট্যাটাস রিনিউ করা
-                await self.client(UpdateStatusRequest(offline=False))
-                await self.client(GetConfigRequest())  # লাইভ কানেকশন সকেট ওয়ার্ম রাখা
+                msgs = await self.client.get_messages(entity, limit=1)
+                if not msgs:
+                    continue
+
+                latest_msg = msgs[0]
+                if latest_msg.id > last_id:
+                    last_id = latest_msg.id
+                    self.spawn(self.process_msg(latest_msg, "fast_tracker"))
+
             except FloodWaitError as err:
                 await asyncio.sleep(err.seconds)
+                continue
             except Exception as err:
-                print(f"[!] {self.name} keep_online warn: {err}")
-            await asyncio.sleep(ONLINE_INTERVAL)
+                print(f"[!] {self.name} tracker error ({channel}): {err}")
+                await asyncio.sleep(2)
+                continue
 
     async def warm_up(self):
-        for target in TARGET_CHANNELS + [DEFAULT_BOT]:
+        for target in TARGET_CHANNELS:
             try:
-                await self.client.get_input_entity(target)
+                self.channel_entities[target] = await self.client.get_input_entity(target)
             except Exception as err:
-                print(f"[!] {self.name} warm-up error ({target}): {err}")
+                print(f"[!] {self.name} entity error ({target}): {err}")
+
+        try:
+            await self.client.get_input_entity(DEFAULT_BOT)
+        except Exception as err:
+            print(f"[!] {self.name} entity error ({DEFAULT_BOT}): {err}")
 
     async def start(self):
         await self.client.connect()
         if not await self.client.is_user_authorized():
-            print(f"[-] {self.name}: Session invalid/expired!")
+            print(f"[-] {self.name}: session invalid, skipping this account")
             await self.client.disconnect()
             return
 
         me = await self.client.get_me()
         await self.warm_up()
 
-        # কানেকশন তৈরি হওয়ার পরই ইভেন্ট রেজিস্টার করা
-        self.client.add_event_handler(lambda e: self.process_msg(e.message, "new"), events.NewMessage(chats=TARGET_CHANNELS))
-        self.client.add_event_handler(lambda e: self.process_msg(e.message, "edit"), events.MessageEdited(chats=TARGET_CHANNELS))
+        self.client.add_event_handler(self.on_new, events.NewMessage(chats=TARGET_CHANNELS))
+        self.client.add_event_handler(self.on_edit, events.MessageEdited(chats=TARGET_CHANNELS))
 
-        print(f"[+] {self.name} Connected & Armed: {me.first_name}")
+        for channel in TARGET_CHANNELS:
+            self.spawn(self.fast_channel_tracker(channel))
 
-        # ব্যাকগ্রাউন্ডে অনলাইন স্ট্যাটাস চালু
-        self.spawn(self.keep_online())
+        print(f"[+] {self.name} armed and ready: {me.first_name}")
 
         await self.send_log(
-            f"🚀 <b>Sniper Active & Online!</b>\n"
+            f"⚡ <b>Fast-Tracker Armed!</b>\n"
             f"👤 User: <b>{me.first_name}</b>\n"
             f"🎯 Channels: <code>{', '.join(TARGET_CHANNELS)}</code>\n"
-            f"🤖 Target: <code>@{DEFAULT_BOT}</code>"
+            f"🔄 Poll interval: {POLL_INTERVAL}s"
         )
         await self.client.run_until_disconnected()
 
