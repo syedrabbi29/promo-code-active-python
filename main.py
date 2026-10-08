@@ -199,14 +199,25 @@ class SniperWorker:
         if not entity:
             return
 
+        # অ্যাকাউন্টগুলোর মাঝে মিলিসেকেন্ড ডিলে যাতে একই সার্ভার আইপি থেকে কলিশন না হয়
+        if "2" in self.name:
+            await asyncio.sleep(0.4)
+
         last_id = 0
-        try:
-            msgs = await self.client.get_messages(entity, limit=1)
-            if msgs:
-                last_id = msgs[0].id
-        except Exception as err:
-            print(f"[!] {self.name} tracker init error ({channel}): {err}")
-            return
+        # কানেক্ট করার সময় FloodWait আসলে অপেক্ষা করে আবার ট্রাই করার নিরাপদ লুপ
+        while last_id == 0:
+            try:
+                msgs = await self.client.get_messages(entity, limit=1)
+                if msgs:
+                    last_id = msgs[0].id
+                else:
+                    break
+            except FloodWaitError as err:
+                print(f"[!] {self.name} tracker init flood wait: {err.seconds}s")
+                await asyncio.sleep(err.seconds + 1)
+            except Exception as err:
+                print(f"[!] {self.name} tracker init error ({channel}): {err}")
+                await asyncio.sleep(2)
 
         while True:
             await asyncio.sleep(POLL_INTERVAL)
@@ -221,7 +232,7 @@ class SniperWorker:
                     self.spawn(self.process_msg(latest_msg, "fast_tracker"))
 
             except FloodWaitError as err:
-                await asyncio.sleep(err.seconds)
+                await asyncio.sleep(err.seconds + 1)
                 continue
             except Exception as err:
                 print(f"[!] {self.name} tracker error ({channel}): {err}")
@@ -258,7 +269,7 @@ class SniperWorker:
         for channel in TARGET_CHANNELS:
             self.spawn(self.fast_channel_tracker(channel))
 
-        # প্রতি ২৫ সেকেন্ডে অনলাইন স্ট্যাটাস রিনিউ চালু
+        # অনলাইন স্ট্যাটাস রিনিউ চালু
         self.spawn(self.keep_online())
 
         print(f"[+] {self.name} armed and ready: {me.first_name}")
