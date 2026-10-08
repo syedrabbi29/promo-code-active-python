@@ -8,7 +8,9 @@ from flask import Flask
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, BotResponseTimeoutError
 from telethon.sessions import StringSession
+from telethon.tl.functions.account import UpdateStatusRequest
 
+# ================= CONFIGURATION =================
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 
@@ -34,6 +36,7 @@ TARGET_CHANNELS = [
 ]
 DEFAULT_BOT = os.environ.get("TARGET_BOT", "klyxx_bot")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", 0.8))
+ONLINE_INTERVAL = float(os.environ.get("ONLINE_INTERVAL", 25))
 LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET_HOURS", 6))))
 
 CODE_PATTERN = re.compile(r'Code:\s*([A-Za-z0-9_-]+)', re.IGNORECASE)
@@ -44,7 +47,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Ultra-Fast Dual Sniper Running 24/7!"
+    return "Ultra-Fast 24/7 Online Dual Sniper Running!"
 
 
 def run_flask():
@@ -180,6 +183,17 @@ class SniperWorker:
     async def on_edit(self, event):
         await self.process_msg(event.message, "push_edit")
 
+    async def keep_online(self):
+        """উভয় অ্যাকাউন্টকে ২৪ ঘণ্টা সক্রিয় ও অনলাইনে রাখার ব্যাকগ্রাউন্ড লুপ"""
+        while True:
+            try:
+                await self.client(UpdateStatusRequest(offline=False))
+            except FloodWaitError as err:
+                await asyncio.sleep(err.seconds)
+            except Exception as err:
+                print(f"[!] {self.name} keep_online warn: {err}")
+            await asyncio.sleep(ONLINE_INTERVAL)
+
     async def fast_channel_tracker(self, channel):
         entity = self.channel_entities.get(channel)
         if not entity:
@@ -236,19 +250,25 @@ class SniperWorker:
         me = await self.client.get_me()
         await self.warm_up()
 
+        # পুশ ইভেন্ট হ্যান্ডলার রেজিস্টার
         self.client.add_event_handler(self.on_new, events.NewMessage(chats=TARGET_CHANNELS))
         self.client.add_event_handler(self.on_edit, events.MessageEdited(chats=TARGET_CHANNELS))
 
+        # আল্ট্রা ফাস্ট ট্র্যাকার চালু
         for channel in TARGET_CHANNELS:
             self.spawn(self.fast_channel_tracker(channel))
+
+        # প্রতি ২৫ সেকেন্ডে অনলাইন স্ট্যাটাস রিনিউ চালু
+        self.spawn(self.keep_online())
 
         print(f"[+] {self.name} armed and ready: {me.first_name}")
 
         await self.send_log(
-            f"⚡ <b>Fast-Tracker Armed!</b>\n"
+            f"⚡ <b>Fast-Tracker & Online Keeper Armed!</b>\n"
             f"👤 User: <b>{me.first_name}</b>\n"
             f"🎯 Channels: <code>{', '.join(TARGET_CHANNELS)}</code>\n"
-            f"🔄 Poll interval: {POLL_INTERVAL}s"
+            f"🔄 Tracker interval: {POLL_INTERVAL}s\n"
+            f"🟢 Keep-Online interval: {ONLINE_INTERVAL}s"
         )
         await self.client.run_until_disconnected()
 
