@@ -10,24 +10,9 @@ from telethon.errors import FloodWaitError, BotResponseTimeoutError
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateStatusRequest
 
-# ================= CONFIGURATION =================
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
-
-ACCOUNTS = [
-    (
-        "Account-1",
-        os.environ.get("SESSION_STRING", ""),
-        API_ID,
-        API_HASH,
-    ),
-    (
-        "Account-2",
-        os.environ.get("SESSION_STRING_2", ""),
-        int(os.environ.get("API_ID_2") or API_ID),
-        os.environ.get("API_HASH_2") or API_HASH,
-    ),
-]
+MAX_ACCOUNTS = 10
 
 TARGET_CHANNELS = [
     c.strip()
@@ -47,7 +32,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Ultra-Fast 24/7 Online Dual Sniper Running!"
+    return "Ultra-Fast Multi-Account Sniper Running!"
 
 
 def run_flask():
@@ -55,9 +40,23 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 
+def load_accounts():
+    accounts = []
+    for index in range(1, MAX_ACCOUNTS + 1):
+        suffix = "" if index == 1 else f"_{index}"
+        session = os.environ.get(f"SESSION_STRING{suffix}", "")
+        if not session:
+            continue
+        api_id = int(os.environ.get(f"API_ID{suffix}") or API_ID)
+        api_hash = os.environ.get(f"API_HASH{suffix}") or API_HASH
+        accounts.append((f"Account-{index}", session, api_id, api_hash))
+    return accounts
+
+
 class SniperWorker:
-    def __init__(self, name, session, api_id, api_hash):
+    def __init__(self, name, session, api_id, api_hash, poll_offset):
         self.name = name
+        self.poll_offset = poll_offset
         self.client = TelegramClient(
             StringSession(session),
             api_id,
@@ -172,7 +171,7 @@ class SniperWorker:
             f"✅ {result}\n"
             f"📡 Source: {source}\n"
             f"🕒 {label}: {event_time.astimezone(LOCAL_TZ):%H:%M:%S}\n"
-            f"📥 Seen: {datetime.fromtimestamp(seen_at, LOCAL_TZ):%H:%M:%S} (+{lag:.1f}s)\n"
+            f"📥 Seen: {datetime.fromtimestamp(seen_at, LOCAL_TZ):%H:%M:%S} (up to +{lag:.1f}s)\n"
             f"⚡ Action took: {action_ms:.0f} ms\n"
             f"📝 Post ID: <code>{msg.id}</code>"
         )
@@ -184,7 +183,6 @@ class SniperWorker:
         await self.process_msg(event.message, "push_edit")
 
     async def keep_online(self):
-        """উভয় অ্যাকাউন্টকে ২৪ ঘণ্টা সক্রিয় ও অনলাইনে রাখার ব্যাকগ্রাউন্ড লুপ"""
         while True:
             try:
                 await self.client(UpdateStatusRequest(offline=False))
@@ -199,25 +197,21 @@ class SniperWorker:
         if not entity:
             return
 
-        # অ্যাকাউন্টগুলোর মাঝে মিলিসেকেন্ড ডিলে যাতে একই সার্ভার আইপি থেকে কলিশন না হয়
-        if "2" in self.name:
-            await asyncio.sleep(0.4)
-
         last_id = 0
-        # কানেক্ট করার সময় FloodWait আসলে অপেক্ষা করে আবার ট্রাই করার নিরাপদ লুপ
         while last_id == 0:
             try:
                 msgs = await self.client.get_messages(entity, limit=1)
-                if msgs:
-                    last_id = msgs[0].id
-                else:
+                if not msgs:
                     break
+                last_id = msgs[0].id
             except FloodWaitError as err:
                 print(f"[!] {self.name} tracker init flood wait: {err.seconds}s")
                 await asyncio.sleep(err.seconds + 1)
             except Exception as err:
                 print(f"[!] {self.name} tracker init error ({channel}): {err}")
                 await asyncio.sleep(2)
+
+        await asyncio.sleep(self.poll_offset)
 
         while True:
             await asyncio.sleep(POLL_INTERVAL)
@@ -261,39 +255,39 @@ class SniperWorker:
         me = await self.client.get_me()
         await self.warm_up()
 
-        # পুশ ইভেন্ট হ্যান্ডলার রেজিস্টার
         self.client.add_event_handler(self.on_new, events.NewMessage(chats=TARGET_CHANNELS))
         self.client.add_event_handler(self.on_edit, events.MessageEdited(chats=TARGET_CHANNELS))
 
-        # আল্ট্রা ফাস্ট ট্র্যাকার চালু
         for channel in TARGET_CHANNELS:
             self.spawn(self.fast_channel_tracker(channel))
 
-        # অনলাইন স্ট্যাটাস রিনিউ চালু
         self.spawn(self.keep_online())
 
-        print(f"[+] {self.name} armed and ready: {me.first_name}")
+        dc_id = self.client.session.dc_id
+        print(f"[+] {self.name} armed and ready: {me.first_name} (home DC {dc_id})")
 
         await self.send_log(
             f"⚡ <b>Fast-Tracker & Online Keeper Armed!</b>\n"
             f"👤 User: <b>{me.first_name}</b>\n"
+            f"🌍 Home DC: <b>{dc_id}</b>\n"
             f"🎯 Channels: <code>{', '.join(TARGET_CHANNELS)}</code>\n"
-            f"🔄 Tracker interval: {POLL_INTERVAL}s\n"
+            f"🔄 Tracker interval: {POLL_INTERVAL}s (offset {self.poll_offset:.2f}s)\n"
             f"🟢 Keep-Online interval: {ONLINE_INTERVAL}s"
         )
         await self.client.run_until_disconnected()
 
 
 async def main():
-    workers = [
-        SniperWorker(name, session, api_id, api_hash).start()
-        for name, session, api_id, api_hash in ACCOUNTS
-        if session
-    ]
-
-    if not workers:
+    accounts = load_accounts()
+    if not accounts:
         print("[-] No valid sessions found!")
         return
+
+    count = len(accounts)
+    workers = [
+        SniperWorker(name, session, api_id, api_hash, POLL_INTERVAL * index / count).start()
+        for index, (name, session, api_id, api_hash) in enumerate(accounts)
+    ]
 
     results = await asyncio.gather(*workers, return_exceptions=True)
     for result in results:
