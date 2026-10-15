@@ -16,15 +16,40 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 MAX_ACCOUNTS = 10
 
-TARGET_CHANNELS = [
-    c.strip()
-    for c in os.environ.get("TARGET_CHANNELS", "klyx_news").split(",")
-    if c.strip()
+
+def clean_name(value):
+    value = value.strip()
+    value = re.sub(r'^(https?://)?(t\.me|telegram\.me)/', '', value)
+    return value.split('?')[0].lstrip('@').strip('/')
+
+
+def parse_names(env_name, default):
+    names = []
+    for item in os.environ.get(env_name, default).split(','):
+        name = clean_name(item)
+        if name and name.lower() not in [n.lower() for n in names]:
+            names.append(name)
+    return names
+
+
+TARGET_CHANNELS = parse_names("TARGET_CHANNELS", "klyx_news")
+DEFAULT_BOT = clean_name(os.environ.get("TARGET_BOT", "klyxx_bot"))
+
+GIVEAWAY_CHANNELS = parse_names("GIVEAWAY_CHANNELS", "smartupdate011,lolololo0172")
+GIVEAWAY_BOTS = parse_names("GIVEAWAY_BOTS", "MoneyPlugGiveawayBot")
+GIVEAWAY_CHANNELS_LOWER = {c.lower() for c in GIVEAWAY_CHANNELS}
+GIVEAWAY_BOTS_LOWER = {b.lower() for b in GIVEAWAY_BOTS}
+GIVEAWAY_CHAT_IDS = set()
+
+WATCH_CHANNELS = TARGET_CHANNELS + [
+    c for c in GIVEAWAY_CHANNELS if c.lower() not in {t.lower() for t in TARGET_CHANNELS}
 ]
-DEFAULT_BOT = os.environ.get("TARGET_BOT", "klyxx_bot")
+
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", 0.8))
+POLLERS_PER_CHANNEL = int(os.environ.get("POLLERS_PER_CHANNEL", 0))
 ONLINE_INTERVAL = float(os.environ.get("ONLINE_INTERVAL", 25))
 FIRE_STAGGER = float(os.environ.get("FIRE_STAGGER_MS", 0)) / 1000
+WALLET_COOLDOWN = float(os.environ.get("WALLET_COOLDOWN", 8))
 LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET_HOURS", 6))))
 
 CODE_PATTERN = re.compile(r'Code:\s*([A-Za-z0-9_-]+)', re.IGNORECASE)
@@ -54,7 +79,8 @@ def load_accounts():
             continue
         api_id = int(os.environ.get(f"API_ID{suffix}") or API_ID)
         api_hash = os.environ.get(f"API_HASH{suffix}") or API_HASH
-        accounts.append((f"Account-{index}", session, api_id, api_hash))
+        wallet = os.environ.get(f"GRAM_ADDRESS{suffix}", "").strip()
+        accounts.append((f"Account-{index}", session, api_id, api_hash, wallet))
     return accounts
 
 
@@ -81,6 +107,23 @@ def build_plan(msg):
     return None
 
 
+def build_giveaway_plan(msg):
+    buttons = msg.buttons
+    if not buttons:
+        return None
+
+    for row in buttons:
+        for btn in row:
+            url = getattr(btn, 'url', None)
+            if not url:
+                continue
+            link = DEEP_LINK_PATTERN.search(url)
+            if link and link.group(1).lower() in GIVEAWAY_BOTS_LOWER:
+                return Plan("giveaway", link.group(1), link.group(2), msg.chat_id, msg.id, None, btn.text)
+
+    return None
+
+
 class Hub:
     def __init__(self):
         self.workers = []
@@ -99,7 +142,10 @@ class Hub:
         if key in self.claimed:
             return
 
-        plan = build_plan(msg)
+        if msg.chat_id in GIVEAWAY_CHAT_IDS:
+            plan = build_giveaway_plan(msg)
+        else:
+            plan = build_plan(msg)
         if plan is None:
             return
         self.claimed.add(key)
@@ -126,9 +172,11 @@ HUB = Hub()
 
 
 class SniperWorker:
-    def __init__(self, name, session, api_id, api_hash, poll_offset):
+    def __init__(self, name, session, api_id, api_hash, wallet, index, count):
         self.name = name
-        self.poll_offset = poll_offset
+        self.wallet = wallet
+        self.index = index
+        self.count = count
         self.client = TelegramClient(
             StringSession(session),
             api_id,
@@ -139,6 +187,8 @@ class SniperWorker:
         )
         self.client.flood_sleep_threshold = 0
         self.fired_payloads = set()
+        self.wallet_prompts = set()
+        self.last_wallet_sent = {}
         self.tasks = set()
         self.channel_entities = {}
         self.entities_by_chat = {}
@@ -158,8 +208,8 @@ class SniperWorker:
     def log(self, text):
         self.spawn(self.send_log(text))
 
-    async def fire(self, bot, payload):
-        key = (bot.lower(), payload)
+    async def fire(self, bot, payload, unique=None):
+        key = (bot.lower(), payload, unique)
         if key in self.fired_payloads:
             return f"Already sent <code>/start {payload}</code>"
         self.fired_payloads.add(key)
@@ -201,10 +251,11 @@ class SniperWorker:
 
     async def execute(self, plan, info):
         try:
-            if plan.kind == "command":
-                result = await self.fire(plan.bot, plan.payload)
-            else:
+            if plan.kind == "callback":
                 result = await self.click_callback(plan)
+            else:
+                unique = plan.msg_id if plan.kind == "giveaway" else None
+                result = await self.fire(plan.bot, plan.payload, unique)
         except Exception as err:
             self.log(f"⚠️ Execution error: {err}")
             return False
@@ -230,6 +281,41 @@ class SniperWorker:
     async def on_edit(self, event):
         await HUB.handle(self, event.message, "push_edit")
 
+    async def on_bot_message(self, event):
+        text = (event.raw_text or "").lower()
+
+        if "sorry" in text and "slots" in text:
+            self.log("😞 All giveaway slots were already reserved")
+            return
+
+        if "wallet address" in text and "send your" in text:
+            await self.send_wallet(event)
+
+    async def send_wallet(self, event):
+        if not self.wallet:
+            self.log("⚠️ Giveaway asked for a wallet address but no GRAM_ADDRESS is set for this account")
+            return
+
+        prompt_key = (event.chat_id, event.id)
+        if prompt_key in self.wallet_prompts:
+            return
+        self.wallet_prompts.add(prompt_key)
+
+        if time.time() - self.last_wallet_sent.get(event.chat_id, 0) < WALLET_COOLDOWN:
+            return
+
+        try:
+            await event.respond(self.wallet)
+        except FloodWaitError as err:
+            self.log(f"⏳ Flood wait while sending wallet: {err.seconds}s")
+            return
+        except Exception as err:
+            self.log(f"⚠️ Failed to send wallet address: {err}")
+            return
+
+        self.last_wallet_sent[event.chat_id] = time.time()
+        self.log("💳 <b>Wallet address sent to the giveaway bot</b>")
+
     async def keep_online(self):
         while True:
             try:
@@ -240,7 +326,14 @@ class SniperWorker:
                 print(f"[!] {self.name} keep_online warn: {err}")
             await asyncio.sleep(ONLINE_INTERVAL)
 
-    async def fast_channel_tracker(self, channel):
+    def poll_offset_for(self, channel_index):
+        pollers = POLLERS_PER_CHANNEL if 0 < POLLERS_PER_CHANNEL < self.count else self.count
+        slot = (self.index - channel_index) % self.count
+        if slot >= pollers:
+            return None
+        return POLL_INTERVAL * slot / pollers
+
+    async def fast_channel_tracker(self, channel, offset):
         entity = self.channel_entities.get(channel)
         if not entity:
             return
@@ -259,7 +352,7 @@ class SniperWorker:
                 print(f"[!] {self.name} tracker init error ({channel}): {err}")
                 await asyncio.sleep(2)
 
-        await asyncio.sleep(self.poll_offset)
+        await asyncio.sleep(offset)
 
         while True:
             await asyncio.sleep(POLL_INTERVAL)
@@ -282,18 +375,22 @@ class SniperWorker:
                 continue
 
     async def warm_up(self):
-        for target in TARGET_CHANNELS:
+        for target in WATCH_CHANNELS:
             try:
                 entity = await self.client.get_input_entity(target)
+                chat_id = utils.get_peer_id(entity)
                 self.channel_entities[target] = entity
-                self.entities_by_chat[utils.get_peer_id(entity)] = entity
+                self.entities_by_chat[chat_id] = entity
+                if target.lower() in GIVEAWAY_CHANNELS_LOWER:
+                    GIVEAWAY_CHAT_IDS.add(chat_id)
             except Exception as err:
                 print(f"[!] {self.name} entity error ({target}): {err}")
 
-        try:
-            await self.client.get_input_entity(DEFAULT_BOT)
-        except Exception as err:
-            print(f"[!] {self.name} entity error ({DEFAULT_BOT}): {err}")
+        for bot in [DEFAULT_BOT] + GIVEAWAY_BOTS:
+            try:
+                await self.client.get_input_entity(bot)
+            except Exception as err:
+                print(f"[!] {self.name} entity error ({bot}): {err}")
 
     async def start(self):
         await self.client.connect()
@@ -305,26 +402,41 @@ class SniperWorker:
         me = await self.client.get_me()
         await self.warm_up()
 
-        self.client.add_event_handler(self.on_new, events.NewMessage(chats=TARGET_CHANNELS))
-        self.client.add_event_handler(self.on_edit, events.MessageEdited(chats=TARGET_CHANNELS))
+        self.client.add_event_handler(self.on_new, events.NewMessage(chats=WATCH_CHANNELS))
+        self.client.add_event_handler(self.on_edit, events.MessageEdited(chats=WATCH_CHANNELS))
+        if GIVEAWAY_BOTS:
+            self.client.add_event_handler(
+                self.on_bot_message,
+                events.NewMessage(incoming=True, from_users=GIVEAWAY_BOTS),
+            )
 
         HUB.register(self)
 
-        for channel in TARGET_CHANNELS:
-            self.spawn(self.fast_channel_tracker(channel))
+        polled = []
+        for channel_index, channel in enumerate(WATCH_CHANNELS):
+            offset = self.poll_offset_for(channel_index)
+            if offset is None:
+                continue
+            polled.append(channel)
+            self.spawn(self.fast_channel_tracker(channel, offset))
 
         self.spawn(self.keep_online())
 
         dc_id = self.client.session.dc_id
         print(f"[+] {self.name} armed and ready: {me.first_name} (home DC {dc_id})")
+        if not self.wallet:
+            print(f"[!] {self.name}: no GRAM_ADDRESS set, giveaway payouts will not be requested")
 
         await self.send_log(
             f"⚡ <b>Shared-Dispatch Sniper Armed!</b>\n"
             f"👤 User: <b>{me.first_name}</b>\n"
             f"🌍 Home DC: <b>{dc_id}</b>\n"
-            f"🎯 Channels: <code>{', '.join(TARGET_CHANNELS)}</code>\n"
-            f"🔄 Tracker interval: {POLL_INTERVAL}s (offset {self.poll_offset:.2f}s)\n"
+            f"🎯 Promo channels: <code>{', '.join(TARGET_CHANNELS)}</code>\n"
+            f"🎁 Giveaway channels: <code>{', '.join(GIVEAWAY_CHANNELS) or '-'}</code>\n"
+            f"🤖 Giveaway bots: <code>{', '.join(GIVEAWAY_BOTS) or '-'}</code>\n"
+            f"🔄 Polling: {', '.join(polled) or '-'} every {POLL_INTERVAL}s\n"
             f"🟢 Keep-Online interval: {ONLINE_INTERVAL}s\n"
+            f"💳 Wallet: {'set' if self.wallet else 'missing'}\n"
             f"⏱ Fire stagger: {FIRE_STAGGER * 1000:.0f} ms per account"
         )
         await self.client.run_until_disconnected()
@@ -338,8 +450,8 @@ async def main():
 
     count = len(accounts)
     workers = [
-        SniperWorker(name, session, api_id, api_hash, POLL_INTERVAL * index / count).start()
-        for index, (name, session, api_id, api_hash) in enumerate(accounts)
+        SniperWorker(name, session, api_id, api_hash, wallet, index, count).start()
+        for index, (name, session, api_id, api_hash, wallet) in enumerate(accounts)
     ]
 
     results = await asyncio.gather(*workers, return_exceptions=True)
