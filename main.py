@@ -49,6 +49,9 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", 0.8))
 POLLERS_PER_CHANNEL = int(os.environ.get("POLLERS_PER_CHANNEL", 0))
 ONLINE_INTERVAL = float(os.environ.get("ONLINE_INTERVAL", 25))
 FIRE_STAGGER = float(os.environ.get("FIRE_STAGGER_MS", 0)) / 1000
+WALLET_RETRY_DELAY = float(os.environ.get("WALLET_RETRY_DELAY", 2.5))
+WALLET_REPLY_TIMEOUT = float(os.environ.get("WALLET_REPLY_TIMEOUT", 6))
+WALLET_MAX_ATTEMPTS = int(os.environ.get("WALLET_MAX_ATTEMPTS", 40))
 WALLET_COOLDOWN = float(os.environ.get("WALLET_COOLDOWN", 8))
 LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET_HOURS", 6))))
 
@@ -124,6 +127,27 @@ def build_giveaway_plan(msg):
     return None
 
 
+def classify_bot_text(text):
+    if "another payout" in text:
+        return "busy"
+    if "processing" in text and "payout" in text:
+        return "processing"
+    if "giveaway claimed" in text or "view transaction" in text:
+        return "done"
+    if "sorry" in text and "slots" in text:
+        return "full"
+    if "wallet address" in text and "send your" in text:
+        return "prompt"
+    return "other"
+
+
+class WalletJob:
+    def __init__(self):
+        self.signal = asyncio.Event()
+        self.outcome = None
+        self.text = ""
+
+
 class Hub:
     def __init__(self):
         self.workers = []
@@ -187,8 +211,8 @@ class SniperWorker:
         )
         self.client.flood_sleep_threshold = 0
         self.fired_payloads = set()
-        self.wallet_prompts = set()
-        self.last_wallet_sent = {}
+        self.wallet_jobs = {}
+        self.last_job_end = {}
         self.tasks = set()
         self.channel_entities = {}
         self.entities_by_chat = {}
@@ -282,39 +306,87 @@ class SniperWorker:
         await HUB.handle(self, event.message, "push_edit")
 
     async def on_bot_message(self, event):
-        text = (event.raw_text or "").lower()
+        await self.handle_bot_text(event, True)
 
-        if "sorry" in text and "slots" in text:
-            self.log("😞 All giveaway slots were already reserved")
+    async def on_bot_edit(self, event):
+        await self.handle_bot_text(event, False)
+
+    async def handle_bot_text(self, event, allow_prompt):
+        text = event.raw_text or ""
+        kind = classify_bot_text(text.lower())
+        job = self.wallet_jobs.get(event.chat_id)
+
+        if job is not None:
+            if kind != "prompt":
+                job.outcome = kind
+                job.text = text[:150]
+                job.signal.set()
             return
 
-        if "wallet address" in text and "send your" in text:
-            await self.send_wallet(event)
+        if kind == "prompt" and allow_prompt:
+            self.start_wallet_job(event)
+        elif kind == "full":
+            self.log("😞 All giveaway slots were already reserved")
+        elif kind == "done":
+            self.log("💰 <b>Giveaway payout confirmed by the bot</b>")
 
-    async def send_wallet(self, event):
+    def start_wallet_job(self, event):
         if not self.wallet:
             self.log("⚠️ Giveaway asked for a wallet address but no GRAM_ADDRESS is set for this account")
             return
 
-        prompt_key = (event.chat_id, event.id)
-        if prompt_key in self.wallet_prompts:
-            return
-        self.wallet_prompts.add(prompt_key)
-
-        if time.time() - self.last_wallet_sent.get(event.chat_id, 0) < WALLET_COOLDOWN:
+        if time.time() - self.last_job_end.get(event.chat_id, 0) < WALLET_COOLDOWN:
             return
 
+        job = WalletJob()
+        self.wallet_jobs[event.chat_id] = job
+        self.spawn(self.submit_wallet(job, event))
+
+    async def submit_wallet(self, job, event):
+        started = time.perf_counter()
+        busy_count = 0
         try:
-            await event.respond(self.wallet)
-        except FloodWaitError as err:
-            self.log(f"⏳ Flood wait while sending wallet: {err.seconds}s")
-            return
-        except Exception as err:
-            self.log(f"⚠️ Failed to send wallet address: {err}")
-            return
+            for attempt in range(1, WALLET_MAX_ATTEMPTS + 1):
+                job.outcome = None
+                job.signal.clear()
 
-        self.last_wallet_sent[event.chat_id] = time.time()
-        self.log("💳 <b>Wallet address sent to the giveaway bot</b>")
+                try:
+                    await event.respond(self.wallet)
+                except FloodWaitError as err:
+                    self.log(f"⏳ Flood wait while sending wallet: {err.seconds}s")
+                    await asyncio.sleep(err.seconds + 1)
+                    continue
+                except Exception as err:
+                    self.log(f"⚠️ Failed to send wallet address: {err}")
+                    return
+
+                try:
+                    await asyncio.wait_for(job.signal.wait(), WALLET_REPLY_TIMEOUT)
+                except asyncio.TimeoutError:
+                    continue
+
+                if job.outcome == "busy":
+                    busy_count += 1
+                    await asyncio.sleep(WALLET_RETRY_DELAY)
+                    continue
+
+                elapsed = time.perf_counter() - started
+                if job.outcome in ("processing", "done"):
+                    self.log(
+                        f"💳 <b>Wallet address accepted</b>\n"
+                        f"🔁 Attempts: {attempt} (busy replies: {busy_count})\n"
+                        f"⏱ Took: {elapsed:.1f}s"
+                    )
+                elif job.outcome == "full":
+                    self.log("😞 All giveaway slots were already reserved")
+                else:
+                    self.log(f"⚠️ Unexpected bot reply, stopped retrying:\n{job.text}")
+                return
+
+            self.log(f"⚠️ Gave up after {WALLET_MAX_ATTEMPTS} attempts, payout not confirmed")
+        finally:
+            self.wallet_jobs.pop(event.chat_id, None)
+            self.last_job_end[event.chat_id] = time.time()
 
     async def keep_online(self):
         while True:
@@ -326,8 +398,10 @@ class SniperWorker:
                 print(f"[!] {self.name} keep_online warn: {err}")
             await asyncio.sleep(ONLINE_INTERVAL)
 
-    def poll_offset_for(self, channel_index):
-        pollers = POLLERS_PER_CHANNEL if 0 < POLLERS_PER_CHANNEL < self.count else self.count
+    def poll_offset_for(self, channel_index, channel):
+        pollers = self.count
+        if channel.lower() in GIVEAWAY_CHANNELS_LOWER and 0 < POLLERS_PER_CHANNEL < self.count:
+            pollers = POLLERS_PER_CHANNEL
         slot = (self.index - channel_index) % self.count
         if slot >= pollers:
             return None
@@ -409,12 +483,16 @@ class SniperWorker:
                 self.on_bot_message,
                 events.NewMessage(incoming=True, from_users=GIVEAWAY_BOTS),
             )
+            self.client.add_event_handler(
+                self.on_bot_edit,
+                events.MessageEdited(incoming=True, from_users=GIVEAWAY_BOTS),
+            )
 
         HUB.register(self)
 
         polled = []
         for channel_index, channel in enumerate(WATCH_CHANNELS):
-            offset = self.poll_offset_for(channel_index)
+            offset = self.poll_offset_for(channel_index, channel)
             if offset is None:
                 continue
             polled.append(channel)
@@ -436,7 +514,8 @@ class SniperWorker:
             f"🤖 Giveaway bots: <code>{', '.join(GIVEAWAY_BOTS) or '-'}</code>\n"
             f"🔄 Polling: {', '.join(polled) or '-'} every {POLL_INTERVAL}s\n"
             f"🟢 Keep-Online interval: {ONLINE_INTERVAL}s\n"
-            f"💳 Wallet: {'set' if self.wallet else 'missing'}\n"
+            f"💳 Wallet: {'set' if self.wallet else 'missing'} "
+            f"(retry {WALLET_RETRY_DELAY}s, max {WALLET_MAX_ATTEMPTS} attempts)\n"
             f"⏱ Fire stagger: {FIRE_STAGGER * 1000:.0f} ms per account"
         )
         await self.client.run_until_disconnected()
